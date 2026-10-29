@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "ianm.tinnitus",
+  "name": "Tinnitus notch",
+  "version": "1.0.0",
+  "author": "Ian McMurray",
+  "license": "MIT",
+  "description": "Match a ringing pitch and notch that band out of everything the PC plays.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Tinnitus notch",
+    "description": "Notch one frequency out of playback. Click to tune, right-click to toggle, scroll to nudge the pitch.",
+    "category": "Audio",
+    "aliases": ["tinnitus", "notch", "hearing"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  },
+  "keywords": ["tinnitus", "notch", "audio", "hearing"]
+}

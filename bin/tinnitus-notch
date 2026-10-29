@@ -1,0 +1,1314 @@
+#!/usr/bin/env python3
+"""System-wide playback notch for matching a tinnitus pitch.
+
+The filter is a PipeWire sink in front of whatever output is selected.
+Playback streams are moved onto it. The microphone is never touched.
+A short match tone is mixed in after the notch, so the tone stays audible
+while music through the notch is cut at that frequency.
+
+`meter` prints a before/after level frame while the panel is open.
+It listens only to playback monitors, never to a microphone.
+
+This is a listening filter. It does not treat tinnitus.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import signal
+import struct
+import subprocess
+import sys
+import threading
+import time
+import wave
+from pathlib import Path
+
+SINK = "tinnitus_notch"
+OUTPUT = "tinnitus_notch_output"
+TONE_APP = "tinnitus-notch-tone"
+
+HOME = Path.home()
+STATE_PATH = HOME / ".config" / "tinnitus-notch" / "state.json"
+CONF_PATH = HOME / ".config" / "pipewire" / "tinnitus-notch.conf"
+LOG_DIR = HOME / ".local" / "state" / "tinnitus-notch"
+LOCK_PATH = LOG_DIR / "run.lock"
+
+FREQ_MIN = 500.0
+FREQ_MAX = 14000.0
+Q_MIN = 0.7
+Q_MAX = 30.0
+TONE_AMP = 0.05
+
+DEFAULT_STATE = {
+    "enabled": False,
+    "freq": 6000.0,
+    "q": 8.0,
+    "upstream": "",
+}
+
+
+def clamp_freq(value: float) -> float:
+    return max(FREQ_MIN, min(FREQ_MAX, float(value)))
+
+
+def clamp_q(value: float) -> float:
+    return max(Q_MIN, min(Q_MAX, float(value)))
+
+
+def load_state() -> dict:
+    state = dict(DEFAULT_STATE)
+    try:
+        raw = json.loads(STATE_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        raw = {}
+    if isinstance(raw, dict):
+        if "enabled" in raw:
+            state["enabled"] = bool(raw["enabled"])
+        if "freq" in raw:
+            state["freq"] = clamp_freq(raw["freq"])
+        if "q" in raw:
+            state["q"] = clamp_q(raw["q"])
+        if raw.get("upstream"):
+            state["upstream"] = str(raw["upstream"])
+    return state
+
+
+def save_state(state: dict) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "enabled": bool(state["enabled"]),
+        "freq": clamp_freq(state["freq"]),
+        "q": round(clamp_q(state["q"]), 3),
+        "upstream": str(state.get("upstream") or ""),
+    }
+    tmp = STATE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n")
+    os.replace(tmp, STATE_PATH)
+
+
+def run_cmd(args: list[str], check: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, check=check, text=True, capture_output=True)
+
+
+def pactl_json(kind: str):
+    result = run_cmd(["pactl", "-f", "json", "list", kind])
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+    data = json.loads(result.stdout)
+    return data if isinstance(data, list) else []
+
+
+def sink_names() -> dict[int, str]:
+    found = {}
+    for sink in pactl_json("sinks"):
+        if "index" in sink and sink.get("name"):
+            found[int(sink["index"])] = str(sink["name"])
+    return found
+
+
+# Pulse channel names to PipeWire positions. An unknown name falls back to
+# stereo so a strange card still plays instead of failing the link.
+PULSE_POSITION = {
+    "mono": "MONO",
+    "front-left": "FL",
+    "front-right": "FR",
+    "front-center": "FC",
+    "lfe": "LFE",
+    "side-left": "SL",
+    "side-right": "SR",
+    "front-left-of-center": "FLC",
+    "front-right-of-center": "FRC",
+    "rear-center": "RC",
+    "rear-left": "RL",
+    "rear-right": "RR",
+    "top-center": "TC",
+    "top-front-left": "TFL",
+    "top-front-center": "TFC",
+    "top-front-right": "TFR",
+    "top-rear-left": "TRL",
+    "top-rear-center": "TRC",
+    "top-rear-right": "TRR",
+}
+for _aux in range(16):
+    PULSE_POSITION[f"aux{_aux}"] = f"AUX{_aux}"
+STEREO_POSITIONS = ["FL", "FR"]
+
+
+def sink_by_name(name: str) -> dict | None:
+    for sink in pactl_json("sinks"):
+        if sink.get("name") == name:
+            return sink
+    return None
+
+
+def sink_description(name: str) -> str:
+    sink = sink_by_name(name)
+    if sink is None:
+        return name
+    props = sink.get("properties") or {}
+    desc = str(props.get("device.description") or sink.get("description") or name)
+    for suffix in (
+        " Analog Stereo",
+        " Analog Mono",
+        " Digital Stereo (IEC958)",
+        " Digital Stereo (HDMI)",
+        " Digital Surround 5.1 (HDMI)",
+        " Digital Surround 7.1 (HDMI)",
+    ):
+        if desc.endswith(suffix):
+            desc = desc[: -len(suffix)]
+    return desc.strip() or name
+
+
+def sink_positions(name: str) -> list[str]:
+    """Channel layout of a playback device. Stereo if the map is unfamiliar."""
+    sink = sink_by_name(name)
+    if sink is None:
+        return list(STEREO_POSITIONS)
+    raw = sink.get("channel_map")
+    if isinstance(raw, list):
+        parts = [str(part).strip() for part in raw if str(part).strip()]
+    else:
+        parts = [part.strip() for part in str(raw or "").split(",") if part.strip()]
+    if not parts or len(parts) > 18:
+        return list(STEREO_POSITIONS)
+    positions = []
+    for part in parts:
+        token = PULSE_POSITION.get(part)
+        if token is None:
+            return list(STEREO_POSITIONS)
+        positions.append(token)
+    return positions
+
+
+def default_sink() -> str:
+    result = run_cmd(["pactl", "get-default-sink"])
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def set_default_sink(name: str) -> None:
+    if name:
+        run_cmd(["pactl", "set-default-sink", name])
+
+
+def sink_inputs() -> list[dict]:
+    names = sink_names()
+    rows = []
+    for item in pactl_json("sink-inputs"):
+        props = item.get("properties") or {}
+        sink_index = item.get("sink")
+        rows.append({
+            "index": int(item["index"]),
+            "sink": names.get(int(sink_index), "") if sink_index is not None else "",
+            "node": str(props.get("node.name") or ""),
+            "app": str(props.get("application.name") or ""),
+            "media": str(props.get("media.name") or ""),
+        })
+    return rows
+
+
+def is_filter_output(row: dict) -> bool:
+    return row["node"] == OUTPUT or row["node"].startswith(SINK + "_output")
+
+
+def is_match_tone(row: dict) -> bool:
+    return row["app"] == TONE_APP or row["media"] == TONE_APP
+
+
+def move_input(index: int, sink: str) -> bool:
+    result = run_cmd(["pactl", "move-sink-input", str(index), sink])
+    return result.returncode == 0
+
+
+def filter_node_id() -> int | None:
+    result = run_cmd(["pw-dump", "Node"])
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        nodes = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    for obj in nodes:
+        props = (obj.get("info") or {}).get("props") or {}
+        if props.get("node.name") == SINK:
+            return int(obj["id"])
+    return None
+
+
+def set_params(pairs: list[tuple[str, float]]) -> bool:
+    node_id = filter_node_id()
+    if node_id is None or not pairs:
+        return False
+    body = " ".join(f'"{key}" {float(value):.6g}' for key, value in pairs)
+    expr = "{ params = [ " + body + " ] }"
+    result = run_cmd(["pw-cli", "set-param", str(node_id), "Props", expr])
+    if result.returncode != 0:
+        return False
+    error = (result.stderr or "") + (result.stdout or "")
+    return "error" not in error.lower()
+
+
+def audio_params(state: dict) -> list[tuple[str, float]]:
+    return [
+        ("notch:Freq", clamp_freq(state["freq"])),
+        ("notch:Q", clamp_q(state["q"])),
+        ("notch:Gain", 0.0),
+        ("mix:Gain 1", 1.0),
+        ("mix:Gain 2", 0.0),
+        ("mix:Gain 3", 1.0),
+    ]
+
+
+def quote_conf(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def write_conf(upstream: str, state: dict, positions: list[str] | None = None) -> None:
+    if not upstream or any(ch in upstream for ch in '"\n{}'):
+        raise SystemExit(f"refusing unsafe sink name: {upstream!r}")
+    layout = list(positions or sink_positions(upstream))
+    if not layout or any(not token.isascii() or not token.isalnum() for token in layout):
+        layout = list(STEREO_POSITIONS)
+    desc = sink_description(upstream)
+    label = f"{desc} · notch"
+    freq = clamp_freq(state["freq"])
+    q = clamp_q(state["q"])
+    position_line = " ".join(layout)
+    CONF_PATH.parent.mkdir(parents=True, exist_ok=True)
+    text = f"""# Generated by tinnitus-notch. Safe to delete; it is rewritten on start.
+context.properties = {{
+    log.level = 0
+}}
+
+context.spa-libs = {{
+    audio.convert.* = audioconvert/libspa-audioconvert
+    support.*       = support/libspa-support
+}}
+
+context.modules = [
+    {{ name = libpipewire-module-rt
+        args = {{ rtportal.enabled = false }}
+        flags = [ ifexists nofail ]
+    }}
+    {{ name = libpipewire-module-protocol-native }}
+    {{ name = libpipewire-module-client-node }}
+    {{ name = libpipewire-module-adapter }}
+
+    {{ name = libpipewire-module-filter-chain
+        args = {{
+            node.description = {quote_conf(label)}
+            media.name       = {quote_conf(label)}
+            filter.graph = {{
+                nodes = [
+                    {{ type = builtin name = split label = copy }}
+                    {{
+                        type = builtin
+                        name = notch
+                        label = bq_notch
+                        control = {{ "Freq" = {freq:.4g} "Q" = {q:.4g} "Gain" = 0.0 }}
+                    }}
+                    {{
+                        type = builtin
+                        name = tone
+                        label = sine
+                        control = {{ "Freq" = {freq:.4g} "Ampl" = 0.0 "Offset" = 0.0 "Phase" = 0.0 }}
+                    }}
+                    {{
+                        type = builtin
+                        name = mix
+                        label = mixer
+                        control = {{ "Gain 1" = 1.0 "Gain 2" = 0.0 "Gain 3" = 1.0 }}
+                    }}
+                ]
+                links = [
+                    {{ output = "split:Out" input = "notch:In" }}
+                    {{ output = "notch:Out" input = "mix:In 1" }}
+                    {{ output = "split:Out" input = "mix:In 2" }}
+                    {{ output = "tone:Out" input = "mix:In 3" }}
+                ]
+                inputs = [ "split:In" ]
+                outputs = [ "mix:Out" ]
+            }}
+            audio.channels = {len(layout)}
+            audio.position = [ {position_line} ]
+            capture.props = {{
+                node.name = "{SINK}"
+                media.class = Audio/Sink
+            }}
+            playback.props = {{
+                node.name = "{OUTPUT}"
+                node.passive = true
+                node.dont-move = true
+                node.dont-fallback = true
+                node.linger = true
+                target.object = "{upstream}"
+            }}
+        }}
+    }}
+]
+"""
+    CONF_PATH.write_text(text)
+
+
+def wait_for_sink(timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if SINK in sink_names().values():
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def sweep_streams(upstream: str) -> None:
+    for row in sink_inputs():
+        if is_filter_output(row) or is_match_tone(row):
+            if row["sink"] != upstream:
+                move_input(row["index"], upstream)
+        elif row["sink"] != SINK:
+            move_input(row["index"], SINK)
+
+
+def restore_streams(upstream: str) -> None:
+    if not upstream:
+        return
+    set_default_sink(upstream)
+    for row in sink_inputs():
+        if is_filter_output(row):
+            continue
+        if row["sink"] != upstream:
+            move_input(row["index"], upstream)
+
+
+def status_payload() -> dict:
+    state = load_state()
+    freq = clamp_freq(state["freq"])
+    q = clamp_q(state["q"])
+    running = SINK in sink_names().values()
+    return {
+        "enabled": bool(state["enabled"]),
+        "freq": freq,
+        "q": q,
+        "upstream": state.get("upstream") or "",
+        "running": running,
+        "bandwidth_hz": round(freq / q),
+    }
+
+
+def cmd_status() -> int:
+    if not STATE_PATH.exists():
+        save_state(load_state())
+    json.dump(status_payload(), sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    return 0
+
+
+def service_active() -> bool:
+    result = run_cmd(["systemctl", "--user", "is-active", "--quiet", "tinnitus-notch.service"])
+    return result.returncode == 0
+
+
+def cmd_on() -> int:
+    state = load_state()
+    state["enabled"] = True
+    if not state.get("upstream"):
+        current = default_sink()
+        if current and current != SINK:
+            state["upstream"] = current
+    save_state(state)
+    result = run_cmd(["systemctl", "--user", "enable", "--now", "tinnitus-notch.service"])
+    if result.returncode != 0:
+        sys.stderr.write(result.stderr or result.stdout or "failed to start tinnitus-notch.service\n")
+        state["enabled"] = False
+        save_state(state)
+        return 1
+    if not wait_for_sink(5):
+        sys.stderr.write("the notch sink did not appear\n")
+        log = LOG_DIR / "pipewire.log"
+        if log.exists():
+            tail = log.read_text(errors="replace").splitlines()[-20:]
+            sys.stderr.write("\n".join(tail) + "\n")
+        run_cmd(["systemctl", "--user", "disable", "--now", "tinnitus-notch.service"])
+        state["enabled"] = False
+        save_state(state)
+        return 1
+    cmd_status()
+    return 0
+
+
+def cmd_off() -> int:
+    state = load_state()
+    state["enabled"] = False
+    save_state(state)
+    run_cmd(["systemctl", "--user", "disable", "--now", "tinnitus-notch.service"])
+    # The service restores the previous output as it exits. If it was not
+    # running, put streams back ourselves in case a sink was left behind.
+    if SINK in sink_names().values():
+        restore_streams(state.get("upstream") or default_sink())
+    cmd_status()
+    return 0
+
+
+def parse_adjust(text: str, current: float, clamp) -> float:
+    text = text.strip()
+    if text.startswith(("+", "-")) and text[1:].replace(".", "", 1).isdigit():
+        return clamp(current + float(text))
+    return clamp(float(text))
+
+
+def cmd_freq(text: str) -> int:
+    state = load_state()
+    state["freq"] = parse_adjust(text, state["freq"], clamp_freq)
+    save_state(state)
+    if SINK in sink_names().values():
+        set_params([("notch:Freq", state["freq"]), ("tone:Freq", state["freq"])])
+    cmd_status()
+    return 0
+
+
+def cmd_q(text: str) -> int:
+    state = load_state()
+    state["q"] = parse_adjust(text, state["q"], clamp_q)
+    save_state(state)
+    if SINK in sink_names().values():
+        set_params([("notch:Q", state["q"])])
+    cmd_status()
+    return 0
+
+
+def write_tone_wav(path: Path, freq: float, seconds: float = 1.6) -> None:
+    rate = 48000
+    count = int(rate * seconds)
+    fade = int(rate * 0.04)
+    amp = 0.08
+    with wave.open(str(path), "w") as handle:
+        handle.setnchannels(2)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        frames = bytearray()
+        for i in range(count):
+            env = 1.0
+            if i < fade:
+                env = i / fade
+            elif i > count - fade:
+                env = max(0.0, (count - i) / fade)
+            sample = int(max(-1.0, min(1.0, amp * env * math.sin(2 * math.pi * freq * i / rate))) * 32767)
+            frames += struct.pack("<hh", sample, sample)
+        handle.writeframes(frames)
+
+
+def play_tone_file(sink: str, freq: float) -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    path = LOG_DIR / "match-tone.wav"
+    write_tone_wav(path, freq)
+    props = json.dumps({
+        "application.name": TONE_APP,
+        "media.name": TONE_APP,
+        "node.dont-move": True,
+    })
+    subprocess.run(
+        ["pw-play", "--target", sink, "-P", props, str(path)],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def write_silence(path: Path, seconds: float = 2.2) -> None:
+    rate = 48000
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "w") as handle:
+        handle.setnchannels(2)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        handle.writeframes(b"\x00\x00" * (2 * int(rate * seconds)))
+
+
+def keep_filter_awake() -> subprocess.Popen[bytes]:
+    # The sine lives in the filter graph, and the graph sleeps until some
+    # stream is playing into it. Silence is enough to let the match tone out.
+    path = LOG_DIR / "silence.wav"
+    write_silence(path)
+    return subprocess.Popen(
+        ["pw-play", "--target", SINK, str(path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def cmd_tone() -> int:
+    state = load_state()
+    freq = clamp_freq(state["freq"])
+    if SINK in sink_names().values() and set_params([("tone:Freq", freq), ("tone:Ampl", 0.0)]):
+        token = f"{os.getpid()}-{time.time()}\n"
+        token_path = LOG_DIR / "tone.token"
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        token_path.write_text(token)
+        keeper = keep_filter_awake()
+        try:
+            for amp in (0.015, 0.03, TONE_AMP):
+                if token_path.read_text() != token:
+                    return 0
+                set_params([("tone:Ampl", amp)])
+                time.sleep(0.03)
+            deadline = time.monotonic() + 1.35
+            while time.monotonic() < deadline:
+                if token_path.read_text() != token:
+                    return 0
+                time.sleep(0.05)
+        finally:
+            if token_path.exists() and token_path.read_text() == token:
+                set_params([("tone:Ampl", 0.0)])
+            if keeper.poll() is None:
+                keeper.terminate()
+        return 0
+    sink = state.get("upstream") or default_sink()
+    if not sink or sink == SINK:
+        sys.stderr.write("no output to play the match tone on\n")
+        return 1
+    play_tone_file(sink, freq)
+    return 0
+
+
+class Supervisor:
+    def __init__(self, upstream: str, no_route: bool) -> None:
+        self.upstream = upstream
+        self.no_route = no_route
+        self.proc: subprocess.Popen[str] | None = None
+        self.routed = False
+        self.stop = False
+        self.applied: tuple[float, float] | None = None
+        self.log_handle = None
+
+    def request_stop(self, _signum, _frame) -> None:
+        self.stop = True
+
+    def start_filter(self) -> None:
+        state = load_state()
+        layout = sink_positions(self.upstream)
+        attempts = [layout]
+        if layout != STEREO_POSITIONS:
+            attempts.append(list(STEREO_POSITIONS))
+        last_error = "notch sink did not appear"
+        for positions in attempts:
+            self.stop_filter()
+            try:
+                self._spawn_filter(state, positions)
+                return
+            except RuntimeError as exc:
+                last_error = str(exc)
+                if positions == STEREO_POSITIONS:
+                    break
+                print(
+                    f"layout {' '.join(positions)} did not start, retrying stereo",
+                    flush=True,
+                )
+        raise RuntimeError(last_error)
+
+    def _spawn_filter(self, state: dict, positions: list[str]) -> None:
+        write_conf(self.upstream, state, positions)
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        self.log_handle = open(LOG_DIR / "pipewire.log", "w")
+        self.proc = subprocess.Popen(
+            ["pipewire", "-c", str(CONF_PATH)],
+            stdout=subprocess.DEVNULL,
+            stderr=self.log_handle,
+            start_new_session=True,
+        )
+        if not wait_for_sink(5):
+            raise RuntimeError("notch sink did not appear")
+        self.apply(force=True)
+
+    def apply(self, force: bool = False) -> None:
+        state = load_state()
+        key = (clamp_freq(state["freq"]), clamp_q(state["q"]))
+        if not force and key == self.applied:
+            return
+        if set_params(audio_params(state) + [("tone:Freq", key[0])]):
+            if force:
+                set_params([("tone:Ampl", 0.0)])
+            self.applied = key
+
+    def stop_filter(self) -> None:
+        proc = self.proc
+        self.proc = None
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=1)
+        if self.log_handle is not None:
+            self.log_handle.close()
+            self.log_handle = None
+
+    def engage(self) -> None:
+        if self.no_route:
+            return
+        set_default_sink(SINK)
+        sweep_streams(self.upstream)
+        self.routed = True
+
+    def retarget(self, upstream: str) -> None:
+        if not upstream or upstream == SINK or upstream == self.upstream:
+            return
+        print(f"following output {upstream}", flush=True)
+        self.upstream = upstream
+        state = load_state()
+        state["upstream"] = upstream
+        save_state(state)
+        if self.routed:
+            set_default_sink(upstream)
+            restore_streams(upstream)
+        self.stop_filter()
+        self.applied = None
+        self.start_filter()
+        self.engage()
+
+    def tick(self) -> None:
+        state = load_state()
+        if not self.no_route and not state["enabled"]:
+            self.stop = True
+            return
+        if self.proc is None or self.proc.poll() is not None:
+            raise RuntimeError("filter process exited")
+        self.apply()
+        if self.no_route:
+            return
+        current = default_sink()
+        if current and current != SINK and current != self.upstream:
+            self.retarget(current)
+            return
+        if current != SINK:
+            set_default_sink(SINK)
+        sweep_streams(self.upstream)
+        self.routed = True
+
+    def cleanup(self) -> None:
+        if self.routed:
+            restore_streams(self.upstream)
+            self.routed = False
+        self.stop_filter()
+
+    def run(self) -> int:
+        signal.signal(signal.SIGTERM, self.request_stop)
+        signal.signal(signal.SIGINT, self.request_stop)
+        try:
+            self.start_filter()
+            self.engage()
+            print(f"notch on {self.upstream}", flush=True)
+            while not self.stop:
+                self.tick()
+                if self.stop:
+                    break
+                time.sleep(0.25)
+        finally:
+            self.cleanup()
+        return 0
+
+
+def cmd_run(upstream: str | None, no_route: bool) -> int:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    lock_file = open(LOCK_PATH, "a")
+    try:
+        import fcntl
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.stderr.write("tinnitus-notch is already running\n")
+        return 1
+    state = load_state()
+    if not no_route and not state["enabled"]:
+        return 0
+    chosen = upstream or ""
+    if not chosen:
+        current = default_sink()
+        chosen = current if current and current != SINK else str(state.get("upstream") or "")
+    if not chosen:
+        sys.stderr.write("no playback device to attach the notch to\n")
+        return 1
+    if not no_route:
+        state["upstream"] = chosen
+        save_state(state)
+    supervisor = Supervisor(chosen, no_route)
+    return supervisor.run()
+
+
+def bin_power(path: Path, freq: float) -> float:
+    with wave.open(str(path), "r") as handle:
+        channels = handle.getnchannels()
+        rate = handle.getframerate()
+        count = handle.getnframes()
+        raw = handle.readframes(count)
+    start = int(0.25 * rate)
+    acc_r = 0.0
+    acc_i = 0.0
+    used = 0
+    for i in range(start, count):
+        sample = struct.unpack_from("<h", raw, i * channels * 2)[0] / 32768.0
+        angle = 2 * math.pi * freq * i / rate
+        acc_r += sample * math.cos(angle)
+        acc_i += sample * math.sin(angle)
+        used += 1
+    return math.hypot(acc_r, acc_i) / max(used, 1)
+
+
+def record_playback(monitor: str, sink: str, wav_in: Path, wav_out: Path) -> None:
+    recorder = subprocess.Popen(
+        ["parecord", f"--device={monitor}", "--file-format=wav", "--rate=48000", "--channels=2", str(wav_out)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        time.sleep(0.3)
+        subprocess.run(["pw-play", "--target", sink, str(wav_in)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.2)
+    finally:
+        recorder.terminate()
+        try:
+            recorder.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            recorder.kill()
+
+
+def cmd_self_test() -> int:
+    if SINK in sink_names().values() or service_active():
+        sys.stderr.write("stop the notch before self-test\n")
+        return 1
+    module = run_cmd([
+        "pactl", "load-module", "module-null-sink",
+        "sink_name=tinnitus_selftest",
+        "rate=48000",
+        "sink_properties=device.description=TinnitusSelfTest",
+    ])
+    if module.returncode != 0:
+        sys.stderr.write(module.stderr or "could not load a null sink\n")
+        return 1
+    module_id = module.stdout.strip()
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    stimulus = LOG_DIR / "selftest-in.wav"
+    captured = LOG_DIR / "selftest-out.wav"
+    rate = 48000
+    with wave.open(str(stimulus), "w") as handle:
+        handle.setnchannels(2)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        frames = bytearray()
+        for i in range(rate * 2):
+            t = i / rate
+            sample = 0.3 * (math.sin(2 * math.pi * 1000 * t) + math.sin(2 * math.pi * 6000 * t))
+            value = int(max(-1.0, min(1.0, sample)) * 32767)
+            frames += struct.pack("<hh", value, value)
+        handle.writeframes(frames)
+    proc = subprocess.Popen(
+        [sys.argv[0], "run", "--upstream", "tinnitus_selftest", "--no-route"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        if not wait_for_sink(6):
+            sys.stderr.write("self-test sink did not start\n")
+            return 1
+        failures = []
+        record_playback("tinnitus_selftest.monitor", SINK, stimulus, captured)
+        low = bin_power(captured, 1000)
+        high = bin_power(captured, 6000)
+        print(f"notch at 6 kHz: 1k={low:.5f} 6k={high:.5f}")
+        if low < 0.01 or high <= 0 or low / high < 10:
+            failures.append("6 kHz notch did not cut 6 kHz while leaving 1 kHz")
+        set_params([("notch:Freq", 1000.0), ("notch:Q", 8.0)])
+        time.sleep(0.1)
+        record_playback("tinnitus_selftest.monitor", SINK, stimulus, captured)
+        low = bin_power(captured, 1000)
+        high = bin_power(captured, 6000)
+        print(f"notch at 1 kHz: 1k={low:.5f} 6k={high:.5f}")
+        if high < 0.01 or low <= 0 or high / low < 10:
+            failures.append("retune to 1 kHz did not move the notch")
+        set_params([("notch:Freq", 6000.0), ("notch:Q", 8.0), ("tone:Freq", 6000.0), ("tone:Ampl", TONE_AMP)])
+        silence = LOG_DIR / "silence.wav"
+        write_silence(silence, 1.6)
+        keeper = subprocess.Popen(
+            ["pw-play", "--target", SINK, str(silence)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            time.sleep(0.2)
+            subprocess.run(
+                ["ffmpeg", "-y", "-f", "pulse", "-i", "tinnitus_selftest.monitor", "-t", "0.6", str(captured)],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        finally:
+            set_params([("tone:Ampl", 0.0)])
+            if keeper.poll() is None:
+                keeper.terminate()
+        tone = bin_power(captured, 6000)
+        other = bin_power(captured, 1000)
+        print(f"match tone: 6k={tone:.5f} 1k={other:.5f}")
+        if tone < 0.005 or tone < other * 5:
+            failures.append("match tone was not audible after the notch")
+        if failures:
+            for failure in failures:
+                print("FAIL", failure)
+            return 1
+        print("PASS")
+        return 0
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=4)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        run_cmd(["pactl", "unload-module", module_id])
+
+
+# 25 bins, one octave below the pitch through one octave above.
+# Bin 12 is exactly the notch frequency. Panel.qml meterFreq() must match.
+METER_BINS = 25
+METER_CENTER = 12
+METER_RATE = 48000
+METER_WINDOW = 2048
+METER_DB_FLOOR = 42.0
+METER_SILENCE_RMS = 0.0008
+METER_IN_APP = "Tinnitus notch meter in"
+METER_OUT_APP = "Tinnitus notch meter out"
+_HANN = tuple(0.5 - 0.5 * math.cos(2 * math.pi * i / (METER_WINDOW - 1)) for i in range(METER_WINDOW))
+
+
+def meter_span(freq: float) -> float:
+    nyquist = METER_RATE * 0.45
+    if freq * 2 <= nyquist:
+        return 1.0
+    return math.log(nyquist / freq) / math.log(2)
+
+
+def meter_frequencies(freq: float) -> list[float]:
+    freq = clamp_freq(freq)
+    span = meter_span(freq)
+    freqs = [
+        freq * 2 ** (((i - METER_CENTER) / METER_CENTER) * span)
+        for i in range(METER_BINS)
+    ]
+    freqs[METER_CENTER] = freq
+    return freqs
+
+
+def rms(samples: tuple[float, ...] | list[float]) -> float:
+    total = 0.0
+    count = 0
+    for sample in samples:
+        if not math.isfinite(sample):
+            continue
+        total += sample * sample
+        count += 1
+    if count == 0:
+        return 0.0
+    return math.sqrt(total / count)
+
+
+def goertzel_mag(samples: tuple[float, ...] | list[float], freq: float) -> float:
+    omega = 2 * math.pi * freq / METER_RATE
+    coeff = 2 * math.cos(omega)
+    prev = 0.0
+    prev2 = 0.0
+    for index, sample in enumerate(samples):
+        if not math.isfinite(sample):
+            sample = 0.0
+        sample *= _HANN[index]
+        current = sample + coeff * prev - prev2
+        prev2 = prev
+        prev = current
+    power = prev * prev + prev2 * prev2 - coeff * prev * prev2
+    if power < 0:
+        power = 0.0
+    return math.sqrt(power) / METER_WINDOW
+
+
+def meter_unit(amp: float, peak: float) -> float:
+    if peak <= 1e-12:
+        return 0.0
+    db = 20 * math.log10(max(amp, 1e-12) / peak)
+    return max(0.0, min(1.0, (db + METER_DB_FLOOR) / METER_DB_FLOOR))
+
+
+def build_meter_frame(
+    before: tuple[float, ...] | list[float],
+    after: tuple[float, ...] | list[float],
+    freq: float,
+    quality: float,
+) -> dict:
+    freqs = meter_frequencies(freq)
+    before_mag = [goertzel_mag(before, tone) for tone in freqs]
+    after_mag = [goertzel_mag(after, tone) for tone in freqs]
+    before_rms = rms(before)
+    after_rms = rms(after)
+    payload = {
+        "active": True,
+        "quiet": True,
+        "output_quiet": False,
+        "tone": False,
+        "freq": round(clamp_freq(freq), 1),
+        "cut_db": None,
+        "error": "",
+        "before": [],
+        "after": [],
+    }
+    if before_rms < METER_SILENCE_RMS and after_rms < METER_SILENCE_RMS:
+        return payload
+    if after_rms < METER_SILENCE_RMS:
+        payload["output_quiet"] = True
+        return payload
+
+    before_peak = max(before_mag) or 1e-12
+    after_peak = max(after_mag) or 1e-12
+    payload["quiet"] = False
+    payload["before"] = [round(meter_unit(amp, before_peak), 3) for amp in before_mag]
+    payload["after"] = [round(meter_unit(amp, after_peak), 3) for amp in after_mag]
+
+    center_before = before_mag[METER_CENTER]
+    center_after = after_mag[METER_CENTER]
+    quality = clamp_q(quality)
+    # Skip bins inside the notch when estimating the volume difference
+    # between the input tap and the speaker tap.
+    skip = max(3, math.ceil(8.4 / quality) + 1)
+    ratios = []
+    for index, (ahead, behind) in enumerate(zip(before_mag, after_mag)):
+        if abs(index - METER_CENTER) <= skip:
+            continue
+        if ahead > before_peak * 0.12 and behind > 0:
+            ratios.append(behind / ahead)
+    cut = None
+    if len(ratios) >= 2 and center_before > max(before_peak * 0.08, 1e-7):
+        ratios.sort()
+        mid = len(ratios) // 2
+        gain = ratios[mid] if len(ratios) % 2 else 0.5 * (ratios[mid - 1] + ratios[mid])
+        if gain > 1e-6:
+            cut = 20 * math.log10(max(center_after / gain, 1e-12) / center_before)
+            cut = max(-60.0, min(24.0, cut))
+    if cut is not None and cut > 8 and center_after > after_peak * 0.45:
+        payload["tone"] = True
+    if before_rms < METER_SILENCE_RMS * 4 and center_after > after_peak * 0.45:
+        payload["tone"] = True
+    payload["cut_db"] = None if cut is None else round(cut, 1)
+    return payload
+
+
+def safe_monitor(sink: str) -> str | None:
+    if not sink:
+        return None
+    for char in sink:
+        if not (char.isalnum() or char in "._:-"):
+            return None
+    return sink + ".monitor"
+
+
+def recording_source_name(app: str) -> str | None:
+    outputs = pactl_json("source-outputs")
+    sources = {}
+    for source in pactl_json("sources"):
+        if "index" in source and source.get("name"):
+            sources[int(source["index"])] = str(source["name"])
+    found = None
+    for item in outputs:
+        props = item.get("properties") or {}
+        if props.get("application.name") != app:
+            continue
+        source_index = item.get("source")
+        found = sources.get(int(source_index), "") if source_index is not None else ""
+    return found
+
+
+class MonitorTap:
+    def __init__(self, app: str) -> None:
+        self.app = app
+        self.proc: subprocess.Popen[bytes] | None = None
+        self.device = ""
+        self.generation = 0
+        self.lock = threading.Lock()
+        self.buf = bytearray()
+
+    def start(self, device: str) -> bool:
+        if self.proc is not None and self.proc.poll() is None and self.device == device:
+            return True
+        self.stop()
+        self.device = device
+        self.generation += 1
+        generation = self.generation
+        command = [
+            sys.executable, "-c",
+            "import ctypes,os,signal,sys\n"
+            "ctypes.CDLL(None).prctl(1, signal.SIGTERM)\n"
+            "os.execvp(sys.argv[1], sys.argv[1:])\n",
+            "stdbuf", "-o0",
+            "parecord",
+            "--raw",
+            "--format=float32le",
+            f"--rate={METER_RATE}",
+            "--channels=1",
+            "--latency-msec=50",
+            f"--client-name={self.app}",
+            f"--stream-name={self.app}",
+            f"--device={device}",
+        ]
+        try:
+            self.proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            self.proc = None
+            return False
+        threading.Thread(target=self._read, args=(generation, self.proc), daemon=True).start()
+        return True
+
+    def _read(self, generation: int, proc: subprocess.Popen[bytes]) -> None:
+        stream = proc.stdout
+        if stream is None:
+            return
+        while generation == self.generation:
+            chunk = stream.read(4096)
+            if not chunk or generation != self.generation:
+                break
+            with self.lock:
+                if generation != self.generation:
+                    break
+                self.buf.extend(chunk)
+                keep = METER_WINDOW * 4 * 3
+                if len(self.buf) > keep:
+                    drop = len(self.buf) - keep
+                    drop -= drop % 4
+                    if drop > 0:
+                        del self.buf[:drop]
+
+    def samples(self) -> tuple[float, ...] | None:
+        need = METER_WINDOW * 4
+        with self.lock:
+            if len(self.buf) < need:
+                return None
+            raw = bytes(self.buf[-need:])
+        unpacked = struct.unpack(f"<{METER_WINDOW}f", raw)
+        return tuple(sample if math.isfinite(sample) and abs(sample) < 8 else 0.0 for sample in unpacked)
+
+    def stop(self) -> None:
+        self.generation += 1
+        proc = self.proc
+        self.proc = None
+        with self.lock:
+            self.buf = bytearray()
+        if proc is None or proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=0.6)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=0.6)
+
+
+def _meter_emit(payload: dict) -> None:
+    sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def _blank_meter(freq: float, **extra: object) -> dict:
+    payload = {
+        "active": False,
+        "quiet": True,
+        "output_quiet": False,
+        "tone": False,
+        "freq": round(clamp_freq(freq), 1),
+        "cut_db": None,
+        "error": "",
+        "before": [],
+        "after": [],
+    }
+    payload.update(extra)
+    return payload
+
+
+def cmd_meter() -> int:
+    stop = False
+
+    def request_stop(_signum, _frame) -> None:
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    pre = MonitorTap(METER_IN_APP)
+    post = MonitorTap(METER_OUT_APP)
+    smooth_before: list[float] | None = None
+    smooth_after: list[float] | None = None
+    smooth_cut: float | None = None
+    last_freq = -1.0
+    last_loud: dict | None = None
+    last_loud_at = 0.0
+    verified_pair = ("", "")
+    names_at = 0.0
+    sink_set: set[str] = set()
+    source_set: set[str] = set()
+
+    def refresh_names(force: bool = False) -> None:
+        nonlocal names_at, sink_set, source_set
+        now = time.monotonic()
+        if not force and now - names_at < 0.4:
+            return
+        sink_set = set(sink_names().values())
+        source_set = set()
+        for source in pactl_json("sources"):
+            if source.get("name"):
+                source_set.add(str(source["name"]))
+        names_at = now
+
+    try:
+        while not stop:
+            state = load_state()
+            freq = clamp_freq(state["freq"])
+            quality = clamp_q(state["q"])
+            if abs(freq - last_freq) > 0.5:
+                smooth_before = None
+                smooth_after = None
+                smooth_cut = None
+                last_freq = freq
+            upstream = str(state.get("upstream") or "")
+            pre_name = safe_monitor(SINK)
+            post_name = safe_monitor(upstream)
+            refresh_names()
+            ready = (
+                bool(state.get("enabled"))
+                and SINK in sink_set
+                and pre_name in source_set
+                and post_name in source_set
+            )
+            if not ready:
+                pre.stop()
+                post.stop()
+                verified_pair = ("", "")
+                last_loud = None
+                _meter_emit(_blank_meter(freq, active=SINK in sink_set))
+                time.sleep(0.3)
+                continue
+            if not pre.start(pre_name or "") or not post.start(post_name or ""):
+                _meter_emit(_blank_meter(freq, active=True, error="The level view could not listen to playback."))
+                time.sleep(0.6)
+                continue
+            pair = (pre_name or "", post_name or "")
+            if verified_pair != pair:
+                time.sleep(0.25)
+                in_source = recording_source_name(METER_IN_APP)
+                out_source = recording_source_name(METER_OUT_APP)
+                bad = False
+                for actual, wanted in ((in_source, pre_name), (out_source, post_name)):
+                    if actual != wanted or not actual or not actual.endswith(".monitor"):
+                        bad = True
+                if bad:
+                    sys.stderr.write(f"meter refused {in_source!r} {out_source!r}\n")
+                    pre.stop()
+                    post.stop()
+                    verified_pair = ("", "")
+                    _meter_emit(_blank_meter(
+                        freq,
+                        active=True,
+                        error="The level view stopped to avoid listening to a microphone.",
+                    ))
+                    time.sleep(1.0)
+                    continue
+                verified_pair = pair
+            before = pre.samples()
+            after = post.samples()
+            now = time.monotonic()
+            if before is None or after is None:
+                if last_loud is not None and now - last_loud_at < 0.45:
+                    _meter_emit(last_loud)
+                else:
+                    _meter_emit(_blank_meter(freq, active=True))
+            else:
+                payload = build_meter_frame(before, after, freq, quality)
+                if payload["output_quiet"]:
+                    last_loud = None
+                    _meter_emit(payload)
+                elif not payload["quiet"]:
+                    smooth_before = _mix_meter(smooth_before, payload["before"])
+                    smooth_after = _mix_meter(smooth_after, payload["after"])
+                    payload["before"] = smooth_before
+                    payload["after"] = smooth_after
+                    cut = payload["cut_db"]
+                    if isinstance(cut, (int, float)):
+                        smooth_cut = float(cut) if smooth_cut is None else (0.4 * float(cut) + 0.6 * smooth_cut)
+                        payload["cut_db"] = round(max(-60.0, min(24.0, smooth_cut)), 1)
+                    last_loud = payload
+                    last_loud_at = now
+                    _meter_emit(payload)
+                elif last_loud is not None and now - last_loud_at < 0.45:
+                    _meter_emit(last_loud)
+                else:
+                    smooth_before = None
+                    smooth_after = None
+                    smooth_cut = None
+                    last_loud = None
+                    _meter_emit(payload)
+            time.sleep(0.07)
+    finally:
+        pre.stop()
+        post.stop()
+    return 0
+
+
+def _mix_meter(previous: list[float] | None, current: list[float]) -> list[float]:
+    if previous is None or len(previous) != len(current):
+        return list(current)
+    return [round(0.4 * new + 0.6 * old, 3) for old, new in zip(previous, current)]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Playback notch for a tinnitus pitch")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("status")
+    sub.add_parser("on")
+    sub.add_parser("off")
+    freq = sub.add_parser("freq")
+    freq.add_argument("value")
+    quality = sub.add_parser("q")
+    quality.add_argument("value")
+    sub.add_parser("tone")
+    run = sub.add_parser("run")
+    run.add_argument("--upstream", default=None)
+    run.add_argument("--no-route", action="store_true")
+    sub.add_parser("self-test")
+    sub.add_parser("meter")
+    args = parser.parse_args()
+    if args.cmd == "status":
+        return cmd_status()
+    if args.cmd == "on":
+        return cmd_on()
+    if args.cmd == "off":
+        return cmd_off()
+    if args.cmd == "freq":
+        return cmd_freq(args.value)
+    if args.cmd == "q":
+        return cmd_q(args.value)
+    if args.cmd == "tone":
+        return cmd_tone()
+    if args.cmd == "run":
+        return cmd_run(args.upstream, args.no_route)
+    if args.cmd == "self-test":
+        return cmd_self_test()
+    if args.cmd == "meter":
+        return cmd_meter()
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except BrokenPipeError:
+        raise SystemExit(0)
