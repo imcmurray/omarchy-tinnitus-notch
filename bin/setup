@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Install or remove the tinnitus-notch user service.
 
-Run this after `omarchy plugin add`. It writes only
-~/.config/systemd/user/tinnitus-notch.service. It does not turn the notch on.
-The bar switch does that. `--remove` stops the service and deletes that unit.
+Writes only ~/.config/systemd/user/tinnitus-notch.service. It does not turn
+the notch on. The bar switch does that. Enabling the plugin runs
+`bin/setup --ensure`, which writes the unit when it is missing and rewrites
+it only when this file already contains the plugin marker. `--remove` stops
+the service and deletes that unit. A unit without the marker is left alone.
 """
 
 from __future__ import annotations
@@ -74,39 +76,62 @@ def daemon_reload() -> None:
         fail(result.stderr.strip() or "systemctl --user daemon-reload failed")
 
 
-def write_unit(path: Path) -> None:
+def owned_text(path: Path) -> str | None:
+    if path.is_symlink():
+        fail(f"refusing to replace symlink {path}")
+    if not path.exists():
+        return None
+    if not path.is_file():
+        fail(f"refusing to replace {path}")
+    text = path.read_text(errors="replace")
+    if MARKER not in text:
+        fail(f"{path} is not the tinnitus-notch unit this plugin writes")
+    return text
+
+
+def write_unit(path: Path, text: str) -> None:
     if path.is_symlink():
         fail(f"refusing to replace symlink {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and not path.is_file():
         fail(f"refusing to replace {path}")
     temporary = path.with_suffix(".service.tmp")
-    temporary.write_text(unit_text())
+    temporary.write_text(text)
     os.chmod(temporary, 0o644)
     os.replace(temporary, path)
 
 
-def install(home: Path) -> None:
+def install(home: Path, *, announce_existing: bool) -> None:
     root = installed_root(home)
     binary = root / "bin" / "tinnitus-notch"
     if not binary.is_file():
         fail(f"install the plugin first, then run {root}/bin/setup")
     path = unit_path(home)
-    write_unit(path)
-    daemon_reload()
+    expected = unit_text()
+    current = owned_text(path)
+    if current == expected:
+        if announce_existing:
+            print(f"Already installed {path}")
+        return
+    write_unit(path, expected)
+    try:
+        daemon_reload()
+    except SystemExit:
+        if current is None:
+            path.unlink(missing_ok=True)
+        else:
+            write_unit(path, current)
+        raise
     print(f"Installed {path}")
     print("Turn it on from the bar. Right-click the pitch, or open the panel and use the switch.")
 
 
 def remove(home: Path) -> None:
     path = unit_path(home)
+    if path.exists() or path.is_symlink():
+        owned_text(path)
     systemctl("disable", "--now", UNIT_NAME)
-    if path.is_symlink():
-        fail(f"refusing to remove symlink {path}")
-    if path.is_file():
-        text = path.read_text(errors="replace")
-        if MARKER not in text:
-            fail(f"{path} is not the tinnitus-notch unit this setup wrote")
+    if path.is_file() and not path.is_symlink():
         path.unlink()
     generated = home / ".config" / "pipewire" / "tinnitus-notch.conf"
     if generated.is_file() and not generated.is_symlink():
@@ -120,15 +145,15 @@ def remove(home: Path) -> None:
 
 def main() -> int:
     if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
-        print("Usage: bin/setup [--remove]")
+        print("Usage: bin/setup [--ensure | --remove]")
         return 0
-    if len(sys.argv) > 2 or (len(sys.argv) == 2 and sys.argv[1] != "--remove"):
-        fail("Usage: bin/setup [--remove]")
+    if len(sys.argv) > 2 or (len(sys.argv) == 2 and sys.argv[1] not in ("--ensure", "--remove")):
+        fail("Usage: bin/setup [--ensure | --remove]")
     home = home_dir()
-    if len(sys.argv) == 2:
+    if len(sys.argv) == 2 and sys.argv[1] == "--remove":
         remove(home)
     else:
-        install(home)
+        install(home, announce_existing=sys.argv[-1] != "--ensure")
     return 0
 
 

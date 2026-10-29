@@ -14,10 +14,11 @@ This is a playback filter. It does not treat tinnitus, and silence still rings, 
 
 ```bash
 omarchy plugin add https://github.com/imcmurray/omarchy-tinnitus-notch.git --enable
-~/.config/omarchy/plugins/ianm.tinnitus/bin/setup
 ```
 
-`plugin add --enable` loads the bar widget. `bin/setup` installs the user service that runs the PipeWire filter. It does not turn the notch on. Safe to run again: it replaces its own service file.
+That puts the chip on the bar and installs the user service. It does not turn the notch on. The service file is `~/.config/systemd/user/tinnitus-notch.service`. The bar writes it when the plugin loads, and turning the notch on writes it again if that has not finished. The file is created when it is missing, and replaced only when it already contains this plugin's marker. A different file at that path is left alone.
+
+`bin/setup` does that same write, and nothing else. You do not need to run it to install.
 
 Put the chip wherever you like when Omarchy asks. The default section is the right side of the bar.
 
@@ -46,10 +47,9 @@ Space toggles the notch. Esc closes the panel.
 
 ```bash
 omarchy plugin update ianm.tinnitus
-~/.config/omarchy/plugins/ianm.tinnitus/bin/setup
 ```
 
-Toggle the notch off and on once so the running filter picks up the new helper.
+The next time the bar loads, it refreshes the service file when this plugin owns it. Toggle the notch off and on once so the running filter picks up the new helper.
 
 ## Remove
 
@@ -72,7 +72,7 @@ A plain-language summary of the notched-sound evidence, including studies that d
 
 ## Permissions
 
-Runs as unsandboxed user code inside `omarchy-shell`, plus a user service that starts a PipeWire filter-chain sink. While the notch is on, that sink is the default output and playback streams are moved onto it. The service stops when you turn the notch off, and streams go back to the previous output. `bin/setup` writes only the user unit named above. The level meter listens only to playback monitors and refuses to keep a recorder that is not on a `.monitor` source.
+Runs as unsandboxed user code inside `omarchy-shell`, plus a user service that starts a PipeWire filter-chain sink. While the notch is on, that sink is the default output and playback streams are moved onto it. The service stops when you turn the notch off, and streams go back to the previous output. Enabling the plugin writes only `~/.config/systemd/user/tinnitus-notch.service`, and only when that file is missing or already marked as this plugin's unit. Nothing starts the service except turning the notch on. `bin/setup --remove` is the command that stops it and deletes that unit. The level meter listens only to playback monitors and refuses to keep a recorder that is not on a `.monitor` source.
 
 ## License
 

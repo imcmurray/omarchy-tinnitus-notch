@@ -411,7 +411,26 @@ def service_active() -> bool:
     return result.returncode == 0
 
 
+def ensure_unit(*, echo: bool = False) -> int:
+    setup = Path(__file__).resolve().parent / "setup"
+    result = run_cmd([sys.executable, str(setup), "--ensure"])
+    if result.returncode != 0:
+        sys.stderr.write(result.stderr or "could not install the tinnitus-notch user service\n")
+        return result.returncode or 1
+    if echo and result.stdout:
+        sys.stdout.write(result.stdout)
+        if not result.stdout.endswith("\n"):
+            sys.stdout.write("\n")
+    return 0
+
+
+def cmd_ensure_unit() -> int:
+    return ensure_unit(echo=True)
+
+
 def cmd_on() -> int:
+    if ensure_unit() != 0:
+        return 1
     state = load_state()
     state["enabled"] = True
     if not state.get("upstream"):
@@ -1271,6 +1290,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Playback notch for a tinnitus pitch")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
+    sub.add_parser("ensure-unit")
     sub.add_parser("on")
     sub.add_parser("off")
     freq = sub.add_parser("freq")
@@ -1286,6 +1306,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.cmd == "status":
         return cmd_status()
+    if args.cmd == "ensure-unit":
+        return cmd_ensure_unit()
     if args.cmd == "on":
         return cmd_on()
     if args.cmd == "off":
