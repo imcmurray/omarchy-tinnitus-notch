@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ianm.tinnitus",
   "name": "Tinnitus notch",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "author": "Ian McMurray",
   "license": "MIT",
   "description": "Match a ringing pitch and notch that band out of everything the PC plays.",

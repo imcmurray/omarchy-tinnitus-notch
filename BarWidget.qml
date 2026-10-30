@@ -41,14 +41,7 @@ BarWidget {
 
   onBarChanged: injectPanel()
   onSettingsChanged: injectPanel()
-  Component.onCompleted: unitEnsure.running = true
-
-  Process {
-    id: unitEnsure
-    command: [root.ctl, "ensure-unit"]
-    stdout: SplitParser { onRead: function(line) {} }
-    stderr: SplitParser { onRead: function(line) {} }
-  }
+  Component.onCompleted: Quickshell.execDetached([ctl, "ensure-unit"])
 
   Loader {
     id: panelLoader
